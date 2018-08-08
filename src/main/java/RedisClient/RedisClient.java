@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
 
@@ -43,7 +44,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 *
 * 5. ToDo:
 *       1 维护多个host,port的情况,到时候每个client自己享有一个pool的引用,而整个类则持有一个ConCurrentHashMap<Host+port, pool> 的map
-*       2 做到 类型js的promise的地步,消除 callback hell
+*       2 做到 类型js的promise的地步,消除 callback hell,思路:
+*           首先会尝试使用
+*
+*
 * */
 public class RedisClient implements AutoCloseable {
     static private ConnectionPool pool = new ConnectionPool(128);// 一个进程中共享一个链接池
@@ -156,7 +160,6 @@ public class RedisClient implements AutoCloseable {
 
     }
 
-
     /***************** 各种业务命令 ******************/
     // 只能处理String
     public String get(String key) {
@@ -196,36 +199,6 @@ public class RedisClient implements AutoCloseable {
 
 
 
-
-    /* 辅助函数,也是真正的业务逻辑
-     *  step1 从连接池获取对应的链接
-     *  step2 直接执行命令,返回future,从这个future可以获取结果(RedisResponseDecoder.RedisResponse)
-     * */
-    private RedisFuture sendInternal(String type, Object payload) throws Exception {
-        Channel output = getChannel();
-
-        // 下面执行step2, 把命令写入逻辑开始执行
-        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer();
-        final String reqId = RequestId.next();
-        writeStr(buf, reqId);
-        writeStr(buf, type);
-        writeStr(buf, JSON.toJSONString(payload));
-        Logger.debug(("send payload:" + JSON.toJSONString(payload)));
-
-        // 设置decoder 为decoder设置reqId,用来在获取返回的结果的时候进行检查id是否能够匹配
-        ResponseDecoder decoder = new  ResponseDecoder();
-        decoder.setReqId(reqId);
-        output.pipeline().addLast(decoder);
-
-        // responseHandler
-        RedisFuture future = new RedisFuture(group.next());// 这里只有一个eventLoop
-        RedisResponseHandler notifier = new RedisResponseHandler(future,this);//notifier用来通知future什么时候结束
-        output.pipeline().addLast(notifier);
-
-        output.writeAndFlush(buf);
-        // 需要在这里设置handler,异步的通知RedisFuture
-        return future;
-    }
 
     /* 辅助函数,也是真正的业务逻辑
      *  对比sendInternal版本,里面有个getChannel实际上是阻塞的操作(当然如果连接池有可用连接就不会阻塞)
@@ -426,7 +399,6 @@ class RedisInputStringList{
     public ArrayList<String> arr;
     public ArrayList<String> getArr(){return arr;}
 }
-
 
 
 

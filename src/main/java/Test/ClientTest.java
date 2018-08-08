@@ -15,8 +15,7 @@ public class ClientTest {
     /**
      * 测试所有异步set / get操作是否可行
      * 回调里面是不允许有阻塞操作的
-     * 启动时间大约是: 2s
-     * 目前是2000左右的QPS(客户端的极限)
+     * 目前是2000左右的QPS(客户端的极限，不是服务器的)
      * todo 这里暂时没有办法写成js promise的样子,会导致 callback hell,所以暂时不建议写太复杂的回调
      *
      **/
@@ -25,10 +24,23 @@ public class ClientTest {
     public void asyncGetSetTest() throws Exception{
         //Logger.setDebug();
         int connNum = 10000;
+
         CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
         try (RedisClient client = new RedisClient("127.0.0.1", 3333)) {
             // todo 配置化,从配置文件导入(需要在配置文件里面写出来 命令,对应的response类型名字)
             testForOne(client,c,connNum);
+        }
+        c.await();
+        RedisClient.stop();//
+    }
+
+    @Test
+    public void asyncGetSetTest2() throws Exception{
+        //Logger.setDebug();
+        int connNum = 10000;
+        CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
+        try (RedisClient client = new RedisClient("127.0.0.1", 3333)) {
+            testForThen(client,c,connNum);
         }
         c.await();
         RedisClient.stop();//
@@ -124,10 +136,27 @@ public class ClientTest {
      *
      *
      * **/
-    private void testForOne(RedisClient client,CountDownLatch c,int taskLoad){
+    private void testForThen(RedisClient client,CountDownLatch c,int taskLoad){
         for (int _i = 0; _i < taskLoad; _i++) {
             final int i = _i;
             String val = "(hello)你好,猪精(pig monster)" + _i;
+            client.setAsync(_i + "",val ).then((future,result) -> {
+                RedisFuture r = client.getAsync(i + "");
+                r.addListener(f -> future.notifyNextListener(f.get()));  // 当get完成的时候通知下一个回调执行
+            }).then((future,result)->{
+                c.countDown();
+                assert result.equals(val);
+                future.notifyNextListener(1);
+            });
+        };
+    }
+
+
+
+    private void testForOne(RedisClient client,CountDownLatch c,int taskLoad){
+        for (int _i = 0; _i < taskLoad; _i++) {
+            final int i = _i;
+            String val = "你好,master" + _i;
             client.setAsync(_i + "",val ).addListener(future -> {
                 RedisFuture r = client.getAsync(i + "");
                 r.addListener(f -> {
