@@ -3,7 +3,9 @@ package RedisResponseDecoder;
 
 import RedisClient.RedisException;
 import RedisClient.ResponseRegister;
+import RedisClientHandler.RedisResponseHandler;
 import Util.Logger;
+import Util.Resp;
 import com.alibaba.fastjson.JSON;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
@@ -19,22 +21,13 @@ import java.util.List;
  */
 public class ResponseDecoder extends ReplayingDecoder<Object> {
     static final int MAX_LEN = 1 << 20;
-    private String reqId;
 
-    public void setReqId(String reqId){
-        this.reqId = reqId;
-    }
 
     @Override
     // @todo 设置checkPoint
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
         Logger.debug("decode called");
         String requestId = readStr(in);
-
-        // 校验请求ID是否匹配原来的id
-        if (!requestId.equals(reqId)) {
-            throw new RedisException("request id mismatch  " + requestId + " != " + reqId);
-        }
 
         String type = readStr(in);
         Class<?> clazz =  ResponseRegister.get(type);
@@ -46,7 +39,7 @@ public class ResponseDecoder extends ReplayingDecoder<Object> {
         String content = readStr(in);
         Logger.debug("read response: " + content);
         Object res = JSON.parseObject(content, clazz);
-        out.add(res);
+        out.add(new Resp(requestId,res));
     }
 
     private String readStr(ByteBuf in) {

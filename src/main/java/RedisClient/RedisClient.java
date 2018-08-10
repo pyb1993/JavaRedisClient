@@ -3,6 +3,7 @@ package RedisClient;
 import RedisClientHandler.RedisResponseHandler;
 import RedisResponseDecoder.ResponseDecoder;
 import Util.Logger;
+import Util.RedisConnection;
 import com.alibaba.fastjson.JSON;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
@@ -15,15 +16,19 @@ import io.netty.util.CharsetUtil;
 
 import java.net.InetSocketAddress;
 
+import java.sql.Connection;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 
-/*
+/**
 * 客户端使用Netty来实现
 * 首先生成对应的bootstrap
 * 然后所有的命令都是通过对应的channel实现的,逻辑如下:
@@ -40,18 +45,22 @@ import java.util.concurrent.atomic.AtomicInteger;
 *       线程:  网络IO就一个线程,理论上足够了,除了网络之外的逻辑是非常快的,可以直接在IO线程里面处理(同时也保证不会影响业务线程)
 *       扩展:  一个客户端可以同时支持多个redis操作同时发起(不是pipeline,而是多个连接),所以这里需要handler来保存状态
 *       异步:  客户端可以异步/同步 操作,那么对于异步操作,可以增加callback(调用addListener函数,注意回调在eventLoop执行)
+*       复用:  基于Channel的多路复用,需要特别小心线程安全
 *       关闭:  当一个客户端实例被关闭的时候,整个eventLoop都应该被关闭
 *
 * 5. ToDo:
-*       1 维护多个host,port的情况,到时候每个client自己享有一个pool的引用,而整个类则持有一个ConCurrentHashMap<Host+port, pool> 的map
-*       2 做到 类型js的promise的地步,消除 callback hell,思路:
-*           首先会尝试使用
 *
+*  todo 请求重试,这个需要依靠唯一ID的配合(如果需要去重),这样的话暂时和redis客户端协议就不一样了
+*             所以可以先只重试ConnectionError这种操作
+ *
+ * todo 读写超时 这个只要超过多少s就进行超时(注意这个和连接池的空闲链接超时不是一回事,一般用定时事件实现,定时回调需要设置future对Setfailture)
+ *
 *
 * */
 public class RedisClient implements AutoCloseable {
-    static private ConnectionPool pool = new ConnectionPool(128);// 一个进程中共享一个链接池
+    static private ConnectionPool pool = new ConnectionPool(512);// 一个进程中共享一个链接池
     static private EventLoopGroup group = new NioEventLoopGroup(1);// 一个进程中共享一个eventLoop
+    static AtomicInteger x = new AtomicInteger(0);
 
     private Bootstrap bootstrap;
     public RedisClient(String host, int port){
@@ -91,18 +100,18 @@ public class RedisClient implements AutoCloseable {
         HashMap<String,Class<?>> defaultConfig = new HashMap<>(){{
             put("get",String.class);
             put("incr", Integer.class);
-            put("set", String.class);}};
+            put("set", String.class);
+            put("hget", String.class);
+            put("hset", String.class);
 
+        }};
+        pool.init(bootstrap);
         addToRegister(defaultConfig);
         addToRegister(config);
+        System.out.println("init done");
     }
 
 
-    /**
-     * TODO 利用反射自动注册,获取所有除了辅助方法之外的对象
-     *
-     *
-     * **/
     public void addToRegister(Map<String, Class<?>> config){
         // 初始化注册类型
         if(config == null || config.isEmpty()){
@@ -127,6 +136,7 @@ public class RedisClient implements AutoCloseable {
     }
 
     // 发送命令,获得请求
+    // todo 异步调用,交给客户端去重试
     public RedisFuture send(String type, Object payload) throws RedisException {
         try {
             return sendInternalAsync(type,payload);
@@ -136,14 +146,15 @@ public class RedisClient implements AutoCloseable {
         }
     }
 
-    /* 同步调用的版本
+    /* 同步调用的版本,没有使用send来实现,因为这样效率
+       todo 同步调用, 这里可能会抛异常,重试机制
     * */
     public Object sendSync (String type, Object payload) throws RedisException {
         try {
-            Channel output = getChannel();
+            RedisConnection output = getChannel();
             RedisFuture future = new RedisFuture(group.next());// 这里只有一个eventLoop
             RedisFuture f = this.sendInternal2(output,future,type, payload);
-            Object ret = f.get();
+            Object ret = f.get();//
             return ret;
         } catch (Exception e) {
             throw new RedisException(e);
@@ -151,13 +162,12 @@ public class RedisClient implements AutoCloseable {
     }
 
 
-    public void onResponseDone(Channel notifyChannel){
-        pool.addOrClose(notifyChannel);
+    public void onResponseDone(RedisConnection notifyConnection){
+        //pool.add(notifyConnection);
     }
 
     // 对应的channel已经关闭了,似乎什么也不需要做
     public void onChannelClose(Channel notifyChannel){
-
     }
 
     /***************** 各种业务命令 ******************/
@@ -197,22 +207,17 @@ public class RedisClient implements AutoCloseable {
         return (String) sendSync("hget",new RedisInputStringPair(key,field));
     }
 
-
-
-
     /* 辅助函数,也是真正的业务逻辑
-     *  对比sendInternal版本,里面有个getChannel实际上是阻塞的操作(当然如果连接池有可用连接就不会阻塞)
-     *  所以这里连getChannel()都变成异步连接了,实现逻辑如下:
-     *         结构: Future2本身被Handler所持有,依靠RedisResponseHandler来设置Future的成功,
-     *               然后Future2调用notifyListener,用来设置Future1的成功
-     *         结论: 构造这样的数据结构即可达到目的:(A---->B 代表 B持有A的引用)
-     *               Future(Parameters)------>handler1(需要持有type和payLoad,控制连接成功的过程)
+        结构: Future本身被Handler所持有,依靠RedisResponseHandler来设置Future的成功,
+     *         然后在收到服务器回答时候在handler设置future成功
+     *         构造这样的结构即可达到目的:
+     *               Future(Parameters)------> listener callback(需要持有type和payLoad,控制连接成功的过程)
      *                  |                           |
-     *                  |                           |(Active时调用senInternal2,这样将添加上新的Handler(Decoder,ResponseHandler)
-     *                  |                           | 同时需要让ResponseHandler 持有Future)
-     *                  |-------------->handler2(Read的时候将会设置Future1成功)
+     *                  |                           | 回调时调用SendInternal2
+     *                  |                           |
+     *                  |-------------->decoder,responseHandler(Read的时候将会设置Future1成功)
      * */
-    private RedisFuture sendInternal2(Channel output,RedisFuture future, String type, Object payload) throws Exception {
+    private RedisFuture sendInternal2(RedisConnection connection, RedisFuture future, String type, Object payload) throws Exception {
         // 下面执行step2, 把命令写入逻辑开始执行
         ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer();
         final String reqId = RequestId.next();
@@ -221,50 +226,66 @@ public class RedisClient implements AutoCloseable {
         writeStr(buf, JSON.toJSONString(payload));
         Logger.debug(("send payload:" + JSON.toJSONString(payload)));
 
-        // todo 抽象为函数
-        // 移除所有的handler,保持干净的状态
-        while (output.pipeline().last() != null){
-            output.pipeline().removeLast();
+        /*
+        * ChannelPipeline 是线程安全的， 这意味着N个业务线程可以并发地操作ChannelPipeline
+          而不存在多线程并发问题。但是，ChannelHandler却不是线程安全的，这意味着尽管
+          ChannelPipeline 是线程去全的， 但是仍然需要自己保证ChannelHandler的线程安全。
+        * */
+        Channel output = connection.channel();
+        connection.incrCmd(); // 未完成命令数量加1
+
+        if(connection.handlerReady()){
+            // 这个Connection一定有handler,只需要直接添加future
+            RedisResponseHandler notifier = connection.getResponseHandler();
+            notifier.addFuture(reqId,future);
+        }else{
+            // 没有未完成命令: 移除所有的handler,保持干净的状态
+            while (output.pipeline().last() != null){
+                output.pipeline().removeLast();
+            }
+
+            // 首先要注意,为decoder设置reqId,用来在获取返回的结果的时候进行检查id是否能够匹配
+            ResponseDecoder decoder = new ResponseDecoder();
+            output.pipeline().addLast(decoder);
+
+            // 设置第二个handler,需要该handler来通知future
+            RedisResponseHandler notifier = new RedisResponseHandler(new ConcurrentHashMap<>(),this,connection);
+            notifier.addFuture(reqId,future);
+            output.pipeline().addLast(notifier);
         }
 
-        // 首先要注意,为decoder设置reqId,用来在获取返回的结果的时候进行检查id是否能够匹配
-        ResponseDecoder decoder = new ResponseDecoder();
-        decoder.setReqId(reqId);
-        output.pipeline().addLast(decoder);
-
-        // 设置第二个handler,需要该handler来通知future
-        RedisResponseHandler notifier = new RedisResponseHandler(future,this);//notifier用来通知future什么时候结束
-        output.pipeline().addLast(notifier);
-
+        // 将connection重新加入,以便后来的请求复用
+        pool.add(connection);
         output.writeAndFlush(buf);
         // 需要在这里设置handler,异步的通知RedisFuture
         return future;
     }
 
     /*
-    * 返回一个future,这个future可能包含(连接,发送,获取三个步骤的逻辑),全程异步操作
     *      * 如果能够直接获得Channel(线程池有缓存)
      *       step1: 我们尝试获取channel,如果获取失败,那么执行上述步骤,如果成功,执行step2
      *       step2: 首先拿到了一个Channel(移除所有的handler),然后直接再上面添加两个Handler,最后构造Future
      *     * 否则:
-     *          先构造出future和handler,将上面的逻辑移动到ConnectionActiveHandler里面执行
+     *          先构造出future和handler,将上面的逻辑移动到connect的回调执行
     * */
     private RedisFuture sendInternalAsync(String type, Object payload) throws Exception{
         RedisFuture future = new RedisFuture(group.next());
-        Channel output = pool.getConnection();
+        RedisConnection output = pool.getConnection();
 
         if(output != null){
             // 已经有缓存好的连接了,那么直接执行sendInternal2
+            Logger.show(output.channel() + " call ");
             return sendInternal2(output,future,type,payload);
         }else{
             // 需要创建一个新的channel,并且在connect完成之后实现新的操作(将future和新的handler绑定起来)
+            // 注意,这里的回调会导致连接被放回连接池里面有一个延迟.如果不进行连接池预热会导致性能问题
             ChannelFuture cFuture = bootstrap.connect();
             cFuture.addListener(f -> {
                 if(f.isSuccess()) {
-                    sendInternal2(cFuture.channel(), future, type, payload);
+                    sendInternal2(new RedisConnection(cFuture.channel()), future, type, payload);
                 }else{
                     future.setFailure(f.cause());
-                    Logger.log("connect failed: \n"+ f.cause());
+                    Logger.debug("connect failed: \n" + f.cause());
                 }
             });
         }
@@ -273,21 +294,13 @@ public class RedisClient implements AutoCloseable {
     }
 
 
-    private Channel getChannel() throws Exception{
-        Channel output = pool.getConnection();
-
+    private RedisConnection getChannel() throws Exception{
+        RedisConnection output = pool.getConnection();
         // 如果cachePool里面全部都失效了,那么需要new 一个新的出来
-        // 如果这里采取异步的调用,那么会导致整个逻辑处理非常的费劲,由于大部分情况都不会走到这,所以同步
-        /* 导致的一个问题是,这里实际上是阻塞操作,所以如果在 addListener里面的回调加入这个东西,
-          会导致抛出 io.netty.util.concurrent.BlockingOperationException*/
         if(output == null){
-            output = bootstrap.connect().sync().channel();
+            output = new RedisConnection(bootstrap.connect().sync().channel());
         }
 
-        // 移除可能的handler,这是因为handler是是和Redisfuture相互绑定的,每一次调用都是新的future
-        while (output.pipeline().last() != null){
-            output.pipeline().removeLast();
-        }
         return output;
     }
 
@@ -304,54 +317,171 @@ public class RedisClient implements AutoCloseable {
 
 /* 描述 连接池,是被RedisClient整个类共享,整个进程一起使用
 *  目的 维持长链接
-*  维护 超时的链接会从缓存里面移除
 *  性能 这里不要直接调用size函数,这是O(n)的操作
-*  存在两种情况: 1 pool里面没有可用的channel,那么会一直poll,直到为空
+*  存在两种情况: 1 pool里面没有「可用」的channel,那么会一直poll,直到为空
 *              2 connection目前有剩余,那么直接返回一个connection
 *
 * */
-class ConnectionPool{
-    private class CachedSet extends ConcurrentLinkedQueue<Channel> { }
 
+class ConnectionPool{
+    private class CachedSet extends ConcurrentLinkedQueue<RedisConnection> { }
     final int capacity;
+    final AtomicBoolean rebalanceSubmit = new AtomicBoolean(false);
     final AtomicInteger size = new AtomicInteger(0);
+    int cmdEachConnection = 50; // 每个connection默认的命令数量
     private CachedSet cachePool = new CachedSet();
 
     public ConnectionPool(int capacity){
         this.capacity = capacity;
     }
 
-    public  Channel getConnection(){
-        Channel ret = null;
-        while (ret == null && size.get() > 0){
-            ret = cachePool.poll();
-            size.decrementAndGet();
-            if(ret != null && !ret.isActive()){
-                ret = null;
+    // 初始化
+    // todo 这里可以用多线程初始化
+    public void init(Bootstrap bootstrap)  {
+        int initialSize = (int)(capacity / 2) ;
+        try {
+            while (initialSize-- > 0){
+                RedisConnection.incrementConnectionNum();// 为统计做准备
+                add(new RedisConnection(bootstrap.connect().sync().channel()));
+            }
+        }catch (Exception e){
+            e.printStackTrace();
+            return;
+        }
+    }
+
+
+    // 获取一个可用的链接
+    // 注意避免进入死循环
+    /**
+    * 一个优化策略是:
+     *     因为已经使用预加载的方式提前创建连接了
+     *     所以当连接池上面的连接命令较多,但是还有可用连接的时候,并不产生新的连接
+     *     而是直接在原来的连接上面复用,这样就不会在负载较大的情况下一次性产生过多连接造成错误
+     *     一个策略是:
+     *          如果发现连接池的数量已经大于等于capacity,那么拒绝创建新的连接
+     *     只有连接池里面确实找不到可用的连接的情况下,才会考虑进行创建
+    *
+    *
+    * */
+    public  RedisConnection getConnection(){
+        RedisConnection ret = null;
+        int curSize = size.get();
+        while (curSize-- > 0 && ((ret = cachePool.poll()) != null)){
+            if(!ret.channel().isActive()){
+                size.decrementAndGet();
+            }else if(ret.getNum() > cmdEachConnection){
+                if(RedisConnection.getTotalConnectionNum() >= capacity){
+                    size.decrementAndGet();
+                    break;// 总的连接数量已经很多了.所以直接复用当前的连接
+                }else{
+                    /*
+                    * 当前状态: 总的连接数量还不多,所以可以继续往下找,即便找不到创建新连接可以接受
+                    * 需要注意 ,如果 curSize这个时候刚好为0,就会导致ret被返回
+                    * 而ret实际上已经被重新加入 cachePool 了,所以ret = null 这一句是必须的
+                    * */
+                    cachePool.add(ret);
+                    ret = null;
+                }
+            }else{
+                // 找到一个可用的connection
+                size.decrementAndGet();
+                break;
             }
         }
+        if(ret == null){
+            RedisConnection.incrementConnectionNum();
+        }
+
         return  ret;
     }
 
-    // 这里会有一点小小的race condition,但是即便略微超过capacity也没有关系
+    // 这里会有一点小小的race condition(因为size 本身在 getConnection的地方也会被修改,同时在这个函数也会被修改),但是即便略微超过capacity也没有关系
+    // 需要检查链接是不是可用的
+    // addOrClose 这个操作,可以废弃了,因为handler本身并没有持有该channel
     public void addOrClose(Channel ch){
-        if(ch != null && size.get() < capacity){
-            cachePool.offer(ch);
+     /*    if(ch != null && ch.isActive() && size.get() < capacity){
+            cachePool.offer(new Connection());
             size.incrementAndGet();
         }else{
             ch.close();
         }
+      */
     }
 
-    // 移除一个connection(目前是因为一个客户端关闭,所以暂时不需要维持那么多连接)
-    // 因为从 get() > 8 到 poll之间可能有数据竞争,所以需要double check
-    public void removeOne(){
-        if(size.get() > 8){
-            Channel removed = cachePool.poll();
-            if(removed != null){
-                removed.close();
+    /**
+     * 这里会有一点小小的race condition：
+     *  因为size 本身在 getConnection的地方也会被修改,同时在这个函数也会被修改,但是即便略微超过capacity也没有关系
+     *  另外需要考虑到如果超过了capacity,这时候可能存在正在执行的命令,所以不能关闭,只需要等待
+     *  当所有的命令都执行完毕之后(cmdNum == 0),应该删除
+     *  考虑 此时add操作的调用者是在EventLoop线程里面的,而客户端此时可能调用 incrCmd 的操作
+     *  如果直接关闭,则可能导致刚从getConnection里面获取的Connection变得不可用
+     *  所以需要提供如下保护:
+     *      1 在准备close的时候,需要设置一个状态表示当前正要关闭
+     *      2 在getConnection的时候,需要判断是否处理正在被关闭的状态,如果正在被关闭就不能选择它
+     *      3 如果从getConnection状态直到放回add的过程中,是不允许Connection关闭的
+     *      4 只有完全没有正在使用Connection才允许被关闭
+     *      ----------------------------- 我是分割线----------------------------
+     *      还有另外一种策略:
+     *      1 就是不让handler来允许(不让eventLoop的线程来关闭,而是定时清理所有的handler)
+     *      2 定时器将定时清理ConnectionPool,如果超过capacity就关闭那些没有任务正在允许的Connection
+     *      3 这种定时直接利用并发容器自己就足够保证线程安全了
+     *      4 因此,所有的add操作都会将channel加入pool,如果发现pool的size没有超过capacity的话,就不执行定时任务
+     *      5 否则直接添加一个定时任务,并设置任务已经设置的状态
+     *      6 定时任务:
+     *           如果超过的不多可以依靠定时任务执行
+     *           如果超过的很多需要立刻执行避免链接过多造成内存占用过大,或者超出客户端允许的范围(65536)
+     *
+     * **/
+    public void add(RedisConnection connection){
+        int curSize = size.get();
+        EventLoop loop = connection.channel().eventLoop();
+        if(connection != null && connection.channel().isActive()){
+            cachePool.offer(connection);
+            curSize = size.incrementAndGet();
+        }
+
+        // 对整个连接池进行维护,保证不会太大
+        if(curSize > capacity){
+            if(curSize < 2 * capacity){
+                submitRebalanceTask(loop,2);
+            }else{
+                rebalanceNow();
             }
-            size.decrementAndGet();
+        }
+    }
+
+
+    public void removeOne(){
+        rebalanceNow();
+    }
+
+    /**
+     * 提交任务: 对整个连接池进行遍历处理
+     * 如果已经有定时任务就不会提交
+     * **/
+    public void submitRebalanceTask(EventLoop loop,int delay){
+        if (!rebalanceSubmit.compareAndSet(false,true)){return;}
+        loop.schedule(()->{
+                    this.rebalanceNow();
+                    rebalanceSubmit.set(false);},
+                delay,TimeUnit.SECONDS);
+    }
+
+    // 在当前线程立刻执行,无论是否有定时任务
+    public void rebalanceNow(){
+        int tmpSize = size.get();
+        RedisConnection ret;
+        while (tmpSize-- > 0){
+            if((ret = cachePool.poll()) == null){ break;}// 队列是空
+            // 这个时候不存在其它客户端访问到ret, 如果是idle那么一定可以安全删除
+            if(ret.isIdle()){
+                Logger.show("close channel" + ret.channel());
+                ret.close();// 应该是这里主动将它关闭导致的
+                size.decrementAndGet();
+            }else{
+                cachePool.add(ret);
+            }
         }
     }
 

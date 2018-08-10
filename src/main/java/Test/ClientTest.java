@@ -1,7 +1,5 @@
 package Test;
 import RedisClient.RedisFuture;
-import Util.Logger;
-import org.junit.Assert;
 import org.junit.Test;
 
 import java.util.concurrent.CountDownLatch;
@@ -16,15 +14,16 @@ public class ClientTest {
      * 测试所有异步set / get操作是否可行
      * 回调里面是不允许有阻塞操作的
      * 目前是2000左右的QPS(客户端的极限，不是服务器的)
-     * todo 这里暂时没有办法写成js promise的样子,会导致 callback hell,所以暂时不建议写太复杂的回调
+     *
+     *   修改成Channel多路复用之后效率大大提高,单线程可达到20000QPS左右(不算启动时间)
+     *
      *
      **/
 
     @Test
     public void asyncGetSetTest() throws Exception{
         //Logger.setDebug();
-        int connNum = 10000;
-
+        int connNum = 200000;
         CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
         try (RedisClient client = new RedisClient("127.0.0.1", 3333)) {
             // todo 配置化,从配置文件导入(需要在配置文件里面写出来 命令,对应的response类型名字)
@@ -49,18 +48,20 @@ public class ClientTest {
     /**
      * 异步多线程测试
      * 目前是5000左右的QPS(8个线程，4线程)
+     *
+     * UPDATE:可到达23000QPS左右(启用了Channel的多路复用)
+     *
      * */
     @Test
     public void asyncGetSetTestMultiThread() throws Exception{
         int ThreadNum = 4;
         ExecutorService executors = Executors.newFixedThreadPool(ThreadNum);
-        int connNum = 10000;
+        int connNum = 200000;
         int taskLoad = connNum / ThreadNum;
         CountDownLatch c = new CountDownLatch(connNum);
         RedisClient client = new RedisClient("127.0.0.1", 3333);
 
         for(int _k = 0; _k <  ThreadNum; _k++){
-            final int k = _k;
             executors.execute(() -> { testForOne(client,c,taskLoad);});
         }
 
@@ -74,6 +75,7 @@ public class ClientTest {
     * 测试同步的情况下操作命令,单线程操作
     * 操作10万次,耗时15s
     * 基本上6000左右的QPS
+     *  update: 当我们使用socket复用的时候,做到的QPS是7500左右
     * */
     @Test
     public void getSetTest(){
@@ -94,12 +96,14 @@ public class ClientTest {
      *                  4个任务 耗时9s,11000QPS
      *                  6个任务(6线程),8s,1160QPS
      *                  8个任务(8线程),7.6s 13000QPS
+     *
+     *   UPDATE:   使用Channel多路复用以后, 8线程 QPS达到16000
      * **/
     @Test
     public void getSetTestMultiThread() throws Exception{
         int ThreadNum = 8;
         ExecutorService executors = Executors.newFixedThreadPool(ThreadNum);
-        int connNum = 100000;
+        int connNum = 200000;
         int taskLoad = connNum / ThreadNum;
         RedisClient client = new RedisClient("127.0.0.1", 3333);
         for(int _k = 0; _k <  ThreadNum; _k++){
@@ -152,7 +156,6 @@ public class ClientTest {
     }
 
 
-
     private void testForOne(RedisClient client,CountDownLatch c,int taskLoad){
         for (int _i = 0; _i < taskLoad; _i++) {
             final int i = _i;
@@ -167,5 +170,4 @@ public class ClientTest {
             });
         };
     }
-
 }
