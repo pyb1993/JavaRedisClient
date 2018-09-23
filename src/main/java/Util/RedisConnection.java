@@ -22,8 +22,6 @@ public class RedisConnection{
         cmdNum = new AtomicInteger(0);
     }
 
-
-
     public Channel channel(){
         return  channel;
     }

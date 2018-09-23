@@ -9,24 +9,22 @@ import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.PooledByteBufAllocator;
 import io.netty.channel.*;
+import io.netty.channel.nio.NioEventLoop;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.CharsetUtil;
 
 import java.net.InetSocketAddress;
-
-import java.sql.Connection;
+import java.nio.channels.SelectionKey;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
-
 
 /**
 * 客户端使用Netty来实现
@@ -53,7 +51,18 @@ import java.util.concurrent.atomic.AtomicInteger;
 *  todo 请求重试,这个需要依靠唯一ID的配合(如果需要去重),这样的话暂时和redis客户端协议就不一样了
 *             所以可以先只重试ConnectionError这种操作
  *
+ *  todo 提供一种获取固定连接的模式 client = newClientWithFixedConnection()
+ *
  * todo 读写超时 这个只要超过多少s就进行超时(注意这个和连接池的空闲链接超时不是一回事,一般用定时事件实现,定时回调需要设置future对Setfailture)
+ *
+ * todo 管道 这个需要实现 pipe = client.pipelined() 然后获取一个单独的连接来实现这些功能
+ *          客户端: 需要将所有的命令都写入缓存,然后缓存满了就一次性发送,期间会收到服务器的应答,但是不一定回去处理
+ *          服务器: 对于服务器完全是透明的操作
+ *          和基于CHANNEL的多路复用的区别:
+ *              这里的pipeline将多个命令一起打包,节约了：
+ *              1 发送命令的网络请求
+ *              2 write/read等系统调用
+ *
  *
 *
 * */
@@ -77,7 +86,6 @@ public class RedisClient implements AutoCloseable {
         pool.clear();
         group.shutdownGracefully().sync();// 等到目前所有的listener都执行完
     }
-
 
     /* 这里没有办法使用内部类加载的单例模式,因为没有办法在最开始知道对应的Config  */
 
@@ -103,7 +111,9 @@ public class RedisClient implements AutoCloseable {
             put("set", String.class);
             put("hget", String.class);
             put("hset", String.class);
-
+            put("pfcount",Integer.class);
+            put("pfadd",String.class);
+            put("expire", String.class);
         }};
         pool.init(bootstrap);
         addToRegister(defaultConfig);
@@ -131,8 +141,12 @@ public class RedisClient implements AutoCloseable {
 
     public void close(){
         // 这里不会真的关闭整个客户端的eventLoop,因为客户端实际上没有持有任何资源,所有的channel都是属于pool的
-        // 由于竞争的客户端少了一个,所以选择从pool里面移除一个connection(Channel)
-        pool.removeOne();
+        pool.rebalanceNow();
+        try{
+            RedisConnection ch = getChannel();
+            ch.channel().close().sync();
+        }catch (Exception e){}
+
     }
 
     // 发送命令,获得请求
@@ -202,10 +216,39 @@ public class RedisClient implements AutoCloseable {
     }
 
 
-    //
+    // hget命令
     public String hget(String key, String field){
         return (String) sendSync("hget",new RedisInputStringPair(key,field));
     }
+
+    // pfadd命令 params key value value
+    public String pfadd(String...args){
+        RedisInputStringList sList = new RedisInputStringList(args);
+
+        return (String) sendSync("pfadd",sList);
+    }
+
+    public RedisFuture pfaddAsync(String...args){
+        RedisInputStringList sList = new RedisInputStringList(args);
+
+        return send("pfadd",sList);
+    }
+
+    // 过期设置
+    public String expire(String key,int delay){
+        return (String) sendSync("expire",new RedisInputStringPair(key,delay + ""));
+    }
+
+    // 过期设置
+    public RedisFuture expireAsync(String key,int delay){
+        return send("expire",new RedisInputStringPair(key,delay + ""));
+    }
+
+    // pfcount命令,获取结果
+    public Integer pfcount(String key){
+        return (Integer) sendSync("pfcount",key);
+    }
+
 
     /* 辅助函数,也是真正的业务逻辑
         结构: Future本身被Handler所持有,依靠RedisResponseHandler来设置Future的成功,
@@ -229,7 +272,7 @@ public class RedisClient implements AutoCloseable {
         /*
         * ChannelPipeline 是线程安全的， 这意味着N个业务线程可以并发地操作ChannelPipeline
           而不存在多线程并发问题。但是，ChannelHandler却不是线程安全的，这意味着尽管
-          ChannelPipeline 是线程去全的， 但是仍然需要自己保证ChannelHandler的线程安全。
+          ChannelPipeline 是线程安全的， 但是仍然需要自己保证ChannelHandler的线程安全。
         * */
         Channel output = connection.channel();
         connection.incrCmd(); // 未完成命令数量加1
@@ -338,7 +381,7 @@ class ConnectionPool{
     // 初始化
     // todo 这里可以用多线程初始化
     public void init(Bootstrap bootstrap)  {
-        int initialSize = (int)(capacity / 2) ;
+        int initialSize = (capacity / 2) ;
         try {
             while (initialSize-- > 0){
                 RedisConnection.incrementConnectionNum();// 为统计做准备
@@ -410,19 +453,14 @@ class ConnectionPool{
     }
 
     /**
-     * 这里会有一点小小的race condition：
+     * 这里会有一点race condition：
      *  因为size 本身在 getConnection的地方也会被修改,同时在这个函数也会被修改,但是即便略微超过capacity也没有关系
      *  另外需要考虑到如果超过了capacity,这时候可能存在正在执行的命令,所以不能关闭,只需要等待
      *  当所有的命令都执行完毕之后(cmdNum == 0),应该删除
      *  考虑 此时add操作的调用者是在EventLoop线程里面的,而客户端此时可能调用 incrCmd 的操作
      *  如果直接关闭,则可能导致刚从getConnection里面获取的Connection变得不可用
-     *  所以需要提供如下保护:
-     *      1 在准备close的时候,需要设置一个状态表示当前正要关闭
-     *      2 在getConnection的时候,需要判断是否处理正在被关闭的状态,如果正在被关闭就不能选择它
-     *      3 如果从getConnection状态直到放回add的过程中,是不允许Connection关闭的
-     *      4 只有完全没有正在使用Connection才允许被关闭
-     *      ----------------------------- 我是分割线----------------------------
-     *      还有另外一种策略:
+
+     *      一种策略:
      *      1 就是不让handler来允许(不让eventLoop的线程来关闭,而是定时清理所有的handler)
      *      2 定时器将定时清理ConnectionPool,如果超过capacity就关闭那些没有任务正在允许的Connection
      *      3 这种定时直接利用并发容器自己就足够保证线程安全了

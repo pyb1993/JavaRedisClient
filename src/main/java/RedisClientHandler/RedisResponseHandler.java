@@ -68,7 +68,6 @@ public class RedisResponseHandler extends ChannelInboundHandlerAdapter {
 
 
     // 这里是已经链接上的链接断开了,有空闲链接断开的可能,也有可能是正在使用的请求断开了
-    //
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         RedisClient cl = clientRef.get();
