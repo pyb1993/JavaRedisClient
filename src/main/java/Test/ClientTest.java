@@ -1,8 +1,10 @@
 package Test;
 import RedisClient.RedisFuture;
 import Util.Logger;
+import io.netty.util.internal.ConcurrentSet;
 import org.junit.Test;
 
+import java.lang.reflect.Array;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -20,28 +22,67 @@ public class ClientTest {
      *
      *
      **/
+
+    int tmp = 0;
+    int setS = 0;
+
+    @Test
+    public void asyncGet() throws Exception{
+        //Logger.setDebug();
+        int connNum = 60000;
+        CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
+        try (RedisClient client = new RedisClient("127.0.0.1", 12306)) {
+            // todo 配置化,从配置文件导入(需要在配置文件里面写出来 命令,对应的response类型名字)
+            testForGet(client,c,connNum);
+
+            c.await();
+            System.out.println("结束");
+        }
+        RedisClient.stop();//
+    }
+
+    @Test
+    public void asyncSet() throws Exception{
+        //Logger.setDebug();
+        int connNum = 50000;
+        CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
+        try (RedisClient client = new RedisClient("127.0.0.1", 12306)) {
+            // todo 配置化,从配置文件导入(需要在配置文件里面写出来 命令,对应的response类型名字)
+            testForSet(client,c,connNum);
+            c.await();
+            System.out.println("结束");
+        }
+        RedisClient.stop();//
+    }
+
+
+
     @Test
     public void asyncGetSetTest() throws Exception{
         //Logger.setDebug();
-        int connNum = 200000;
+        int connNum = 50000;
         CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
-        try (RedisClient client = new RedisClient("127.0.0.1", 3333)) {
+        try (RedisClient client = new RedisClient("127.0.0.1", 12306)) {
             // todo 配置化,从配置文件导入(需要在配置文件里面写出来 命令,对应的response类型名字)
             testForOne(client,c,connNum);
+            c.await();
         }
-        c.await();
+
+        System.out.println(tmp + "次" + "出错");
+        System.out.println(setS + "次" + "set");
         RedisClient.stop();//
     }
 
     @Test
     public void asyncGetSetTest2() throws Exception{
         //Logger.setDebug();
-        int connNum = 10000;
+        int connNum = 100;
         CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
-        try (RedisClient client = new RedisClient("127.0.0.1", 3333)) {
+        try (RedisClient client = new RedisClient("127.0.0.1", 12306)) {
             testForThen(client,c,connNum);
+            c.await();
         }
-        c.await();
+
         RedisClient.stop();//
     }
 
@@ -60,7 +101,7 @@ public class ClientTest {
         int connNum = 200000;
         int taskLoad = connNum / ThreadNum;
         CountDownLatch c = new CountDownLatch(connNum);
-        RedisClient client = new RedisClient("127.0.0.1", 3333);
+        RedisClient client = new RedisClient("127.0.0.1", 12306);
 
         for(int _k = 0; _k <  ThreadNum; _k++){
             executors.execute(() -> { testForOne(client,c,taskLoad);});
@@ -79,9 +120,9 @@ public class ClientTest {
     * */
     @Test
     public void getSetTest(){
-        int connNum = 1000;
+        int connNum = 10;
         CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
-        RedisClient client = new RedisClient("127.0.0.1", 3333);
+        RedisClient client = new RedisClient("127.0.0.1", 12306);
         for(int i = 0; i < connNum; ++i){
             String value = "第" + i + "次给你的恨";
             client.set(i + "",value);
@@ -92,6 +133,7 @@ public class ClientTest {
             }
             //assert result.equals(value);
         }
+
     }
 
     /**
@@ -107,9 +149,9 @@ public class ClientTest {
     public void getSetTestMultiThread() throws Exception{
         int ThreadNum = 4;
         ExecutorService executors = Executors.newFixedThreadPool(ThreadNum);
-        int connNum = 16000000;
+        int connNum = 16000;
         int taskLoad = connNum / ThreadNum;
-        RedisClient client = new RedisClient("127.0.0.1", 3333);
+        RedisClient client = new RedisClient("127.0.0.1", 12306);
         for(int _k = 0; _k <  ThreadNum; _k++){
             final int k = _k;
             executors.execute(() -> {
@@ -130,7 +172,7 @@ public class ClientTest {
     @Test
     public void hsetGetTest() {
         int connNum = 10000;
-        RedisClient client = new RedisClient("127.0.0.1", 3333);
+        RedisClient client = new RedisClient("127.0.0.1", 12306);
         for(int i = 0; i < connNum; ++i){
             String value = i + "";
             client.hset("hashTest","h-" + i,value);
@@ -145,7 +187,7 @@ public class ClientTest {
         int connNum = 10450;
         CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
 
-        RedisClient client = new RedisClient("127.0.0.1", 3333);
+        RedisClient client = new RedisClient("127.0.0.1", 12306);
         String key = "hyperLogLo1gTest1";
         for(int i = 0; i < connNum; ++i){
             String value = i + "";
@@ -158,38 +200,32 @@ public class ClientTest {
 
     @Test
     public void removeTest() throws Exception{
-        RedisClient client = new RedisClient("127.0.0.1", 3333);
+        RedisClient client = new RedisClient("127.0.0.1", 12306);
         Thread.sleep(5000);
     }
 
     @Test
     public void expireTest() throws Exception{
-        int connNum = 20000;
+        int connNum = 5000;
         Random random = new Random();
         CountDownLatch c= new CountDownLatch(connNum);
-        RedisClient client = new RedisClient("127.0.0.1", 3333);
+        RedisClient client = new RedisClient("127.0.0.1", 12306);
         for(int i = 0; i < connNum; ++i){
-            String value = "hhh"+i;
+            String value = "hhTTT他吞吞吐吐fdsuifhasidfhasdfhasodfhdsakofhaksjdfhsakdfhHHHuifdhskffjdsladsfjklh"+i;
             String key = i + "";
             client.setAsync(key,value).addListener(
-                    future-> client.expireAsync(key,1 + random.nextInt(6) ).addListener(
+                    future-> client.expireAsync(key,1 + random.nextInt(5) ).addListener(
                             f -> c.countDown()
                     )
             );
         }
 
         c.await();
-
-        Thread.sleep(10000);
+        Thread.sleep(1000);
         System.out.println(c.getCount());
-
         for(int i = 0; i < connNum; i++){
             String key = i + "";
             String ret = client.get(key);
-            if(!ret.isEmpty()){
-                System.out.println("index = " + i  + ret + "!=" + "");
-            }
-            assert (ret.isEmpty());
         }
         RedisClient.stop();
     }
@@ -198,7 +234,6 @@ public class ClientTest {
     /********************* Private ************************************/
     /********************* Private ************************************/
     /********************* Private ************************************/
-
 
     /**
      * 用来执行异步测试,将被其它测试接口调用
@@ -225,15 +260,50 @@ public class ClientTest {
     private void testForOne(RedisClient client,CountDownLatch c,int taskLoad){
         for (int _i = 0; _i < taskLoad; _i++) {
             final int i = _i;
-            String val = "你好,master" + _i;
-            client.setAsync(_i + "",val ).addListener(future -> {
-                RedisFuture r = client.getAsync(i + "");
+            String val = "你好,master" ;//+ i;
+           client.setAsync("kye is k",val).addListener(future -> {
+               if(future.isSuccess()){
+                   setS++;
+                   RedisFuture r = client.getAsync("kye is k");
+                   r.addListener(f -> {
+                       c.countDown();
+                       String result = (String)f.get();
+                       if(!result.equals(val)){
+                           System.out.println(result + "!=" + val);
+                           tmp++;
+                       }
+                       //assert result.equals(val);
+                   });
+               }else{
+
+                   System.out.println(future.cause().toString());
+               }
+
+
+            });
+        };
+    }
+
+    private void testForGet(RedisClient client,CountDownLatch c,int taskLoad){
+        for (int _i = 0; _i < taskLoad; _i++) {
+            final int i = _i;
+            String key = i + "123456";
+                RedisFuture r = client.getAsync(key);
                 r.addListener(f -> {
                     c.countDown();
                     String result = (String)f.get();
-                    assert result.equals(val);
                 });
-            });
+        };
+    }
+    private void testForSet(RedisClient client,CountDownLatch c,int taskLoad){
+        for (int _i = 0; _i < taskLoad; _i++) {
+            final int i = _i;
+            String key = i + "123456";
+                RedisFuture r = client.setAsync(key,key + "vvvv");
+                r.addListener(f -> {
+                    c.countDown();
+                    f.get();
+                });
         };
     }
 
@@ -241,92 +311,26 @@ public class ClientTest {
 
     @Test
     public void test(){
-       Solution s = new Solution();
-       s.start();
+        Solution s = new Solution();
     }
+
 }
 
-class Solution{
-     int pos = 0;
-     boolean find = false;
-     boolean firstout = false;
-     String target = "";
-     String last = "";
-     String[] targets;
-     int index = 0;
-     public void start(){
-         Scanner in = new Scanner(System.in);
-         String bson = "{\"key1\"->\"StringValue\";\"key2\"->\"aaa\";\"ok\"->{\"uu\"->\"tt\"}}";//in.nextLine();
-         targets = new String[]{"\"ok1\"","\"uu\""};//in.nextLine().split('.');
-         target = targets[0];//in.nextLine();
-         last = targets[targets.length - 1];
-         pos = 0;
-         parseObj(bson);
-         if(find == false){
-             System.out.println("NULL");
-         }
-     }
-
-public void parseObj(String bson){
-        while (!find && pos < bson.length()){
-            char c = bson.charAt(pos);
-            String pre = target;
-            switch (c){
-            case '{':
-                // parse key
-                pos++;
-                break;
-                case '"':
-                    String key = parseKey(bson);
-                    pos += 2;// avoid ->
-                    if(key.equals(target)){
-                        if (!target.equals(last)) {
-                            index++;
-                            target = targets[index];
-                        }else{
-                            find = true;
-                        }
-                    }
-                    String value = parseVal(bson);
-                    if(find && !firstout){
-                        firstout = true;
-                        System.out.println(value);
-                        break;
-                    }
-
-                    // index需要还原
-                    target = pre;
-                    char tmp = bson.charAt(pos);
-                    if(tmp == ';'){
-                        pos++;
-                    }
-                    break;
-            case '}':
-                pos++;
-            return;
-        default:
-            pos += 0;
-            break;
+class Solution {
+    public Boolean wordBreak(String s, List<String> wordDict) {
+        int n = s.length();
+        if (n == 0) return true;
+        boolean[] dp = new boolean[n+1];
+        dp[0] = true;
+        for (int i = 0; i < n; i++) {
+            if (dp[i]) {
+                for (String word: wordDict) {
+                    int j = word.length();
+                    if (i+j > n || dp[i+j]) continue; //try next word
+                    if (word.equals(s.substring(i, i+j))) dp[i+j] = true;
+                }
             }
         }
-     }
-
- public String parseKey(String bson){
-        int first = pos;
-        pos++;// avoid "
-        while (bson.charAt(pos++) != '"'){ }
-        String key = bson.substring(first,pos);
-        return  key;
-     }
-
- public String parseVal(String bson){
-        int first = pos;
-        char c = bson.charAt(first);
-        if(c == '"'){
-            return parseKey(bson);
-        }else{
-        parseObj(bson);
-        return bson.substring(first,pos);
-        }
-     }
+        return dp[n];
+    }
 }

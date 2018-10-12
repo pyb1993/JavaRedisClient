@@ -16,7 +16,9 @@ import io.netty.handler.codec.DecoderException;
 import io.netty.handler.codec.ReplayingDecoder;
 import io.netty.util.CharsetUtil;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /* 作用是将返回的数据解析成需要的Response
  * 同时将最终结果设置到对应的client上面,这样client就可以在操作完成之后执行了
@@ -24,23 +26,42 @@ import java.util.List;
  */
 public class ResponseDecoder extends ReplayingDecoder<Object> {
     static final int MAX_LEN = 1 << 20;
+    static Set<String> protocalSet = new HashSet<>() {
+        {this.add("get");
+         this.add("set");
+         this.add("hget");
+         this.add("expire");
+        }};
 
+    public static boolean newProtocal(String key){
+        return protocalSet.contains(key);
+    }
 
     @Override
     // @todo 设置checkPoint
     protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> out) throws Exception {
         Logger.debug("decode called");
         String requestId = readStr(in);
-
         String type = readStr(in);
         Class<?> clazz =  ResponseRegister.get(type);
         if (clazz == null) {
+            String type1 = readStr(in);
             throw new RedisException("unrecognized rpc response type=" + type);
         }
         // 反序列化json串
         String content = readStr(in);
         Logger.debug("read response: " + content);
-        Object res = JSON.parseObject(content, clazz);
+        Object res;
+        if(protocalSet.contains(type)){
+            // 用自定义的协议来解析,目前使用的是简单文本协议
+            // 目前暂时只有一种结构,就是单个字符串,所以不区分
+            // todo 以后的结构以后再增加定义
+            res = content;
+        }else {
+            // 用fastJSON来解析
+            res = JSON.parseObject(content, clazz);
+        }
+
         out.add(new Resp(requestId,res));
     }
 

@@ -17,7 +17,7 @@ import java.util.concurrent.CyclicBarrier;
 * */
 public class DemoClient {
     public static void main(String[] args) throws Exception {
-        try (RedisClient client = new RedisClient("127.0.0.1", 3333)) {
+        try (RedisClient client = new RedisClient("127.0.0.1", 12306)) {
             // todo 配置化,从配置文件导入(需要在配置文件里面写出来 命令,对应的response类型名字)
             CountDownLatch c = new CountDownLatch(5000);
             // 回调里面是不允许有阻塞操作的,但是回调也可能出错,因为eventLoop很可能已经全部关闭了,这样导致没有办法提交任务

@@ -68,23 +68,18 @@ public class RedisResponseHandler extends ChannelInboundHandlerAdapter {
 
 
     // 这里是已经链接上的链接断开了,有空闲链接断开的可能,也有可能是正在使用的请求断开了
+    // 但是这里可能是链接主动关闭,也可能是由于服务器关闭导致的被动关闭
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         RedisClient cl = clientRef.get();
         if(cl != null) {
             for(RedisFuture future : futureMap.values()){
+                // 该通道断开,但是还有任务没有全部完成
                 if(!future.isDone()){
-                    future.setFailure(new RedisException("Connection Closed By peer In Advance"));
+                    future.setFailure(new RedisException("UDFERROR: connection closed in advance"));
                 }
             }
         }
-
-/*        if(!connection.isIdle()){
-            System.out.println(connection.channel() + "" + connection.getNum());
-            for(String reqid : futureMap.keySet()){
-                System.out.println(reqid);
-            }
-        }*/
 
         ctx.fireChannelInactive();
     }

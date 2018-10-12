@@ -16,6 +16,7 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.util.CharsetUtil;
 
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import java.nio.channels.SelectionKey;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -69,7 +70,10 @@ import java.util.concurrent.atomic.AtomicInteger;
 public class RedisClient implements AutoCloseable {
     static private ConnectionPool pool = new ConnectionPool(512);// 一个进程中共享一个链接池
     static private EventLoopGroup group = new NioEventLoopGroup(1);// 一个进程中共享一个eventLoop
-    static AtomicInteger x = new AtomicInteger(0);
+    static AtomicInteger allBytes = new AtomicInteger(0);
+    static AtomicInteger allBytesS = new AtomicInteger(0);
+    static AtomicInteger allBytesG = new AtomicInteger(0);
+    static AtomicInteger allSend = new AtomicInteger(0);
 
     private Bootstrap bootstrap;
     public RedisClient(String host, int port){
@@ -85,6 +89,7 @@ public class RedisClient implements AutoCloseable {
     public static void stop() throws Exception{
         pool.clear();
         group.shutdownGracefully().sync();// 等到目前所有的listener都执行完
+        System.out.println("一共执行" + allSend + "次, 一共发:" + allBytes.get() + " byte" + " get = " + allBytesG.get() + "byte set = " + allBytesS.get());
     }
 
     /* 这里没有办法使用内部类加载的单例模式,因为没有办法在最开始知道对应的Config  */
@@ -145,7 +150,9 @@ public class RedisClient implements AutoCloseable {
         try{
             RedisConnection ch = getChannel();
             ch.channel().close().sync();
-        }catch (Exception e){}
+        }catch (Exception e){
+            System.out.println("EXCEPTION: " + e.getCause());
+        }
 
     }
 
@@ -261,12 +268,20 @@ public class RedisClient implements AutoCloseable {
      *                  |-------------->decoder,responseHandler(Read的时候将会设置Future1成功)
      * */
     private RedisFuture sendInternal2(RedisConnection connection, RedisFuture future, String type, Object payload) throws Exception {
+        allSend.incrementAndGet();
         // 下面执行step2, 把命令写入逻辑开始执行
         ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer();
-        final String reqId = RequestId.next();
-        writeStr(buf, reqId);
+        final String reqId = RequestId.next().substring(0,8);
+        writeStrTest(buf, reqId);
         writeStr(buf, type);
-        writeStr(buf, JSON.toJSONString(payload));
+
+        if(ResponseDecoder.newProtocal(type)){
+            // payload会直接定义好toString的内容
+            writeStr(buf, payload.toString());
+        }else{
+            writeStr(buf, JSON.toJSONString(payload));
+        }
+
         Logger.debug(("send payload:" + JSON.toJSONString(payload)));
 
         /*
@@ -299,7 +314,9 @@ public class RedisClient implements AutoCloseable {
 
         // 将connection重新加入,以便后来的请求复用
         pool.add(connection);
+        allBytes.addAndGet(buf.readableBytes());
         output.writeAndFlush(buf);
+
         // 需要在这里设置handler,异步的通知RedisFuture
         return future;
     }
@@ -328,7 +345,7 @@ public class RedisClient implements AutoCloseable {
                     sendInternal2(new RedisConnection(cFuture.channel()), future, type, payload);
                 }else{
                     future.setFailure(f.cause());
-                    Logger.debug("connect failed: \n" + f.cause());
+                    System.out.println("connect failed: \n" + f.cause());
                 }
             });
         }
@@ -350,6 +367,10 @@ public class RedisClient implements AutoCloseable {
 
     private void writeStr(ByteBuf buf, String s) {
         buf.writeInt(s.getBytes(CharsetUtil.UTF_8).length);
+        buf.writeBytes(s.getBytes(CharsetUtil.UTF_8));
+    }
+
+    private void writeStrTest(ByteBuf buf, String s) {
         buf.writeBytes(s.getBytes(CharsetUtil.UTF_8));
     }
 
@@ -514,7 +535,7 @@ class ConnectionPool{
             if((ret = cachePool.poll()) == null){ break;}// 队列是空
             // 这个时候不存在其它客户端访问到ret, 如果是idle那么一定可以安全删除
             if(ret.isIdle()){
-                Logger.show("close channel" + ret.channel());
+                Logger.show(("close channel" + ret.channel()));
                 ret.close();// 应该是这里主动将它关闭导致的
                 size.decrementAndGet();
             }else{
@@ -538,6 +559,20 @@ class RedisInputStringPair{
         this.first = first;
         this.second = second;
     }
+
+    public String toString(){
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer();
+        byte[] firstBytes = first.getBytes(CharsetUtil.UTF_8);
+        byte[] secondBytes = second.getBytes(CharsetUtil.UTF_8);
+        buf.writeInt(firstBytes.length);
+        buf.writeBytes(firstBytes);
+        buf.writeInt(secondBytes.length);
+        buf.writeBytes(secondBytes);
+        String s = buf.toString(CharsetUtil.UTF_8);
+        buf.release();
+        return s;
+    }
+
     public String getFirst(){
         return  first;
     }
