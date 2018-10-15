@@ -43,7 +43,6 @@ public class RedisResponseHandler extends ChannelInboundHandlerAdapter {
             cl.onResponseDone(connection);
             RedisFuture future = futureMap.get(resp.getReqId());
             future.setSuccess(resp.getResp());
-
             futureMap.remove(resp.getReqId()); // 移除对应的引用
             connection.decrCmd();// 未完成命令数量减少1
         }else{

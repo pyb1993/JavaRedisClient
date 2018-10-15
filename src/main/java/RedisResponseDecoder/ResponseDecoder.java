@@ -29,6 +29,7 @@ public class ResponseDecoder extends ReplayingDecoder<Object> {
     static Set<String> protocalSet = new HashSet<>() {
         {this.add("get");
          this.add("set");
+         this.add("del");
          this.add("hget");
          this.add("expire");
         }};
@@ -45,11 +46,13 @@ public class ResponseDecoder extends ReplayingDecoder<Object> {
         String type = readStr(in);
         Class<?> clazz =  ResponseRegister.get(type);
         if (clazz == null) {
-            String type1 = readStr(in);
             throw new RedisException("unrecognized rpc response type=" + type);
         }
         // 反序列化json串
         String content = readStr(in);
+        if(content == null){
+            System.out.println(1111);
+        }
         Logger.debug("read response: " + content);
         Object res;
         if(protocalSet.contains(type)){

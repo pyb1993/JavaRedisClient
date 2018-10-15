@@ -1,6 +1,7 @@
 package Test;
 import RedisClient.RedisFuture;
 import Util.Logger;
+import io.netty.buffer.UnpooledDirectByteBuf;
 import io.netty.util.internal.ConcurrentSet;
 import org.junit.Test;
 
@@ -13,28 +14,26 @@ import java.util.concurrent.TimeUnit;
 import RedisClient.*;
 
 public class ClientTest {
-    /**
-     * 测试所有异步set / get操作是否可行
-     * 回调里面是不允许有阻塞操作的
-     * 目前是2000左右的QPS(客户端的极限，不是服务器的)
-     *
-     *   修改成Channel多路复用之后效率大大提高,单线程可达到20000QPS左右(不算启动时间)
-     *
-     *
-     **/
+
 
     int tmp = 0;
     int setS = 0;
+    volatile int numForLock = 0;
 
+    /**
+     * 测试异步get操作是否可行
+     * 回调里面是不允许有阻塞操作的
+     * 50万次操作,单线程大约40000QPS
+     *
+     **/
     @Test
     public void asyncGet() throws Exception{
         //Logger.setDebug();
-        int connNum = 60000;
+        int connNum = 300000;
         CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
         try (RedisClient client = new RedisClient("127.0.0.1", 12306)) {
             // todo 配置化,从配置文件导入(需要在配置文件里面写出来 命令,对应的response类型名字)
             testForGet(client,c,connNum);
-
             c.await();
             System.out.println("结束");
         }
@@ -44,7 +43,7 @@ public class ClientTest {
     @Test
     public void asyncSet() throws Exception{
         //Logger.setDebug();
-        int connNum = 50000;
+        int connNum = 100;
         CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
         try (RedisClient client = new RedisClient("127.0.0.1", 12306)) {
             // todo 配置化,从配置文件导入(需要在配置文件里面写出来 命令,对应的response类型名字)
@@ -56,7 +55,15 @@ public class ClientTest {
     }
 
 
-
+    /**
+     * 测试所有异步set / get操作是否可行
+     * 回调里面是不允许有阻塞操作的
+     * 目前是2000左右的QPS(客户端的极限，不是服务器的)
+     *
+     *   修改成Channel多路复用之后效率大大提高,单线程可达到20000QPS左右(不算启动时间)
+     *
+     *
+     **/
     @Test
     public void asyncGetSetTest() throws Exception{
         //Logger.setDebug();
@@ -72,6 +79,53 @@ public class ClientTest {
         System.out.println(setS + "次" + "set");
         RedisClient.stop();//
     }
+
+
+    // 测试第一次是否可以锁上,第二次是否可以解锁,解锁后能否继续锁上;
+    @Test
+    public void LockTest() throws Exception{
+        //Logger.setDebug();
+        int connNum = 50;
+        CountDownLatch c = new CountDownLatch(connNum);//todo XXXX
+        try (RedisClient client = new RedisClient("127.0.0.1", 12306)) {
+            // todo 配置化,从配置文件导入(需要在配置文件里面写出来 命令,对应的response类型名字)
+            testForLock(client,c,connNum);
+            c.await();
+        }
+
+        System.out.println(tmp + "次" + "出错");
+        System.out.println(setS + "次" + "set");
+        RedisClient.stop();//
+    }
+
+
+    // 测试这个分布式锁能不能用
+    @Test
+    public void LockTest2() throws Exception{
+        int ThreadNum = 10;
+        ExecutorService executors = Executors.newFixedThreadPool(ThreadNum);
+        int connNum = 10000;
+        int taskLoad = connNum / ThreadNum;
+        CountDownLatch c = new CountDownLatch(connNum);
+
+        RedisClient client = new RedisClient("127.0.0.1", 12306);
+
+        int prefix = new Random().nextInt(100000);
+        String key = "123456--" + prefix;
+        for(int _k = 0; _k <  ThreadNum; _k++){
+            executors.execute(() -> { testForLock2(client,c,key,taskLoad);});
+        }
+
+        c.await();
+        assert numForLock == connNum;
+        executors.shutdown();
+        executors.awaitTermination(25,TimeUnit.SECONDS);
+    }
+
+
+
+
+
 
     @Test
     public void asyncGetSetTest2() throws Exception{
@@ -133,7 +187,6 @@ public class ClientTest {
             }
             //assert result.equals(value);
         }
-
     }
 
     /**
@@ -206,7 +259,7 @@ public class ClientTest {
 
     @Test
     public void expireTest() throws Exception{
-        int connNum = 5000;
+        int connNum = 30000;
         Random random = new Random();
         CountDownLatch c= new CountDownLatch(connNum);
         RedisClient client = new RedisClient("127.0.0.1", 12306);
@@ -221,7 +274,7 @@ public class ClientTest {
         }
 
         c.await();
-        Thread.sleep(1000);
+        Thread.sleep(6000);
         System.out.println(c.getCount());
         for(int i = 0; i < connNum; i++){
             String key = i + "";
@@ -260,11 +313,12 @@ public class ClientTest {
     private void testForOne(RedisClient client,CountDownLatch c,int taskLoad){
         for (int _i = 0; _i < taskLoad; _i++) {
             final int i = _i;
-            String val = "你好,master" ;//+ i;
-           client.setAsync("kye is k",val).addListener(future -> {
+            String val = "你好,master" + i;
+            String key = i + "";
+           client.setAsync(key,val).addListener(future -> {
                if(future.isSuccess()){
                    setS++;
-                   RedisFuture r = client.getAsync("kye is k");
+                   RedisFuture r = client.getAsync(key);
                    r.addListener(f -> {
                        c.countDown();
                        String result = (String)f.get();
@@ -272,14 +326,11 @@ public class ClientTest {
                            System.out.println(result + "!=" + val);
                            tmp++;
                        }
-                       //assert result.equals(val);
+                       assert result.equals(val);
                    });
                }else{
-
                    System.out.println(future.cause().toString());
                }
-
-
             });
         };
     }
@@ -307,6 +358,33 @@ public class ClientTest {
         };
     }
 
+    private void testForLock(RedisClient client,CountDownLatch c,int taskLoad){
+        int prefix = new Random().nextInt(100000);
+        for (int _i = 0; _i < taskLoad; _i++) {
+            final int i = _i;
+            String key = i + "123456--" + prefix;
+            Boolean suc = client.lock(key,10);
+            Boolean suc2 = client.lock(key,10);
+            client.unlock(key);
+            Boolean suc3 = client.lock(key,10);
+            setS++;
+            c.countDown();
+            if(suc != true || suc2 != false || suc3 != true){
+                tmp++;
+            }
+            assert suc == true && suc2 == false && suc3 == true;
+        };
+    }
+
+    private void testForLock2(RedisClient client,CountDownLatch c,String key,int taskLoad){
+        for (int _i = 0; _i < taskLoad; _i++) {
+            client.lockBlock(key,5,true);
+            numForLock += 1;
+            client.unlock(key);
+            setS++;
+            c.countDown();
+        };
+    }
 
 
     @Test

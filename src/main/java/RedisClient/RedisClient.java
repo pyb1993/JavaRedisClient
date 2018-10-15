@@ -21,6 +21,7 @@ import java.nio.channels.SelectionKey;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
@@ -88,7 +89,7 @@ public class RedisClient implements AutoCloseable {
 
     public static void stop() throws Exception{
         pool.clear();
-        group.shutdownGracefully().sync();// 等到目前所有的listener都执行完
+        group.shutdownGracefully();// 等到目前所有的listener都执行完
         System.out.println("一共执行" + allSend + "次, 一共发:" + allBytes.get() + " byte" + " get = " + allBytesG.get() + "byte set = " + allBytesS.get());
     }
 
@@ -112,6 +113,7 @@ public class RedisClient implements AutoCloseable {
 
         HashMap<String,Class<?>> defaultConfig = new HashMap<>(){{
             put("get",String.class);
+            put("del",String.class);
             put("incr", Integer.class);
             put("set", String.class);
             put("hget", String.class);
@@ -209,12 +211,25 @@ public class RedisClient implements AutoCloseable {
 
     // 只能处理String
     public void set(String key, String value){
-        sendSync("set",new RedisInputStringPair(key,value));
+        set(key,value,false);
+    }
+    public void set(String key, String value,boolean ifNotExist){
+        sendSync("set",new RedisInputStringList(key,value,ifNotExist ? "true" : "false"));
+    }
+
+    public void del(String key){
+        sendSync("del",key);
+    }
+    public RedisFuture delAsync(String key){
+        return send("del",key);
     }
 
     // 异步处理
     public RedisFuture setAsync(String key, String value){
-        return send("set",new RedisInputStringPair(key,value));
+         return setAsync(key,value,false);
+    }
+    public RedisFuture setAsync(String key, String value,boolean ifNotExist){
+        return send("set",new RedisInputStringList(key,value,ifNotExist ? "true" : "false"));
     }
 
     // 只能处理hash
@@ -245,7 +260,6 @@ public class RedisClient implements AutoCloseable {
     public String expire(String key,int delay){
         return (String) sendSync("expire",new RedisInputStringPair(key,delay + ""));
     }
-
     // 过期设置
     public RedisFuture expireAsync(String key,int delay){
         return send("expire",new RedisInputStringPair(key,delay + ""));
@@ -256,6 +270,47 @@ public class RedisClient implements AutoCloseable {
         return (Integer) sendSync("pfcount",key);
     }
 
+
+    public void lockBlock(String key,int timeout,boolean waitAll){
+        while(!lock(key,timeout)){
+            if(!waitAll){
+                throw new RedisException("try to get lock failed after many times");
+            }
+        }
+    }
+
+    // 实现一个分布式锁,这里做最简单的lock,没有随机token
+    public boolean lock(String key,int timeout){
+        try {
+            int tryTimes = 256;
+            String ret = (String) sendSync("set",new RedisInputStringList(key,"","true"));
+            while (tryTimes-- > 0){
+                if(ret.equals("ok")){
+                    expire(key,timeout);
+                    return true;
+                }else{
+                    if((tryTimes & 31) == 0){
+                        System.out.println("try get lock but failed");
+                    }
+                    if((tryTimes & 3) == 0){
+                        Thread.yield();
+                    } else if((tryTimes & 7) == 0){
+                        Thread.sleep(2 + new Random().nextInt(5));
+                    }
+                }
+            }
+        }catch (Exception e){
+            System.out.println(e.getMessage());
+            return false;
+        }
+        return false;
+    }
+
+    // 实现一个分布式锁,这里做最简单的lock,没有随机token
+    public boolean unlock(String key){
+        del(key);
+        return false;
+    }
 
     /* 辅助函数,也是真正的业务逻辑
         结构: Future本身被Handler所持有,依靠RedisResponseHandler来设置Future的成功,
@@ -271,7 +326,7 @@ public class RedisClient implements AutoCloseable {
         allSend.incrementAndGet();
         // 下面执行step2, 把命令写入逻辑开始执行
         ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer();
-        final String reqId = RequestId.next().substring(0,8);
+        final String reqId = RequestId.next().substring(0,12);
         writeStrTest(buf, reqId);
         writeStr(buf, type);
 
@@ -511,10 +566,6 @@ class ConnectionPool{
     }
 
 
-    public void removeOne(){
-        rebalanceNow();
-    }
-
     /**
      * 提交任务: 对整个连接池进行遍历处理
      * 如果已经有定时任务就不会提交
@@ -593,7 +644,7 @@ class RedisInputStringPair{
 // 用来传递两个String的结构
 class RedisInputStringList{
     public RedisInputStringList(String ... args){
-        arr = arr = new ArrayList<String>();
+        arr = new ArrayList<String>();
         for (String str : args){
             arr.add(str);
         }
@@ -601,6 +652,17 @@ class RedisInputStringList{
 
     public ArrayList<String> arr;
     public ArrayList<String> getArr(){return arr;}
+    public String toString(){
+        ByteBuf buf = PooledByteBufAllocator.DEFAULT.directBuffer();
+        for(String item: arr){
+            byte[] Bytes = item.getBytes(CharsetUtil.UTF_8);
+            buf.writeInt(Bytes.length);
+            buf.writeBytes(Bytes);
+        }
+        String s = buf.toString(CharsetUtil.UTF_8);
+        buf.release();
+        return s;
+    }
 }
 
 

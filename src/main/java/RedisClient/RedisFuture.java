@@ -47,7 +47,12 @@ import java.util.function.*;
 
      @Override
     public RedisFuture setSuccess(Object result){
-        super.setSuccess(result);
+        try{
+            super.setSuccess(result);
+        }catch (Throwable e){
+            System.out.println(1111);
+        }
+
         // 异步执行listener(需要依靠listener「内部逻辑」来通知 next)
          if(listener != null){
              loop.execute(()-> listener.accept(this,result));
